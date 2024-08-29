@@ -1,0 +1,322 @@
+---
+title: "Causal Inference Notebook"
+author: "ABS"
+date: "2023-12-07"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction of simple causal questions 
+
+```{r}
+library(broom)
+library(tidyverse)
+library(magrittr)
+# getting the data
+data <- readr::read_csv(file = "https://cdn1.sph.harvard.edu/wp-content/uploads/sites/1268/1268/20/nhefs.csv") %>% 
+  mutate(
+    education = case_when(
+      education == 1  ~ "8th grade or less",
+      education == 2 ~ "HS dropout",
+      education == 3 ~ "HS",
+      education == 4 ~ "College dropout",
+      education == 5 ~ "College or more",
+      T ~ "missing"
+    )
+  ) %>% 
+  mutate(across(.cols = c(qsmk, sex, race, education, exercise, active), .fns = forcats::as_factor)) %>% 
+  drop_na(qsmk, sex, race, education, exercise, active, wt82)
+data %>% head()
+
+```
+
+## Calculate  Causal effect manually 
+
+Causal effect formula 
+
+$$
+RR = E(Y|A=1) - E(Y|A=0) \\
+OR = \frac{E(Y|A=1)}{E(Y|A=0)}
+
+$$
+
+```{r}
+meanvalue  = data %>% 
+  group_by(qsmk) %>% 
+  summarise("meanvalue"= mean(wt82_71)) 
+  
+
+Causal_effect = md$meanvalue[2]-md$meanvalue[1]  
+Causal_effect
+
+```
+
+
+## Calculate causal effect from a model
+
+The estimate value of treatment is the causal effect of the model
+
+```{r}
+
+mm=lm(wt82_71 ~ qsmk, data = data) %>% broom::tidy(.,conf.int = T) %>% 
+  select (estimate, conf.low,conf.high)
+
+mm
+```
+
+
+## IP weighting 
+
+IP weighting is another way of adjusting the treatment value as sometimes values are unadjusted.
+Steps :
+ * Fit a model of treatment by adjusting the other confounder variables.
+ * Then fit the outcome model by weighting the value.
+ 
+Stabilized IP weight vs IP weight 
+
+*Stabilized ip weight = $\frac{E{[A]}}{E[A|L]}$ for treatment 
+*Stabilized ip weight = $\frac{1}{E[A|L]}$ for treatment 
+ 
+```{r}
+prop.table(table(data$qsmk))
+``` 
+
+The table shows that treatment assignment is unbalenced.So we cannot find the actual causal impact for here.So creat a pseudo population and balancing it.
+
+```{r}
+
+treat_model = glm(qsmk ~ 1, family = binomial(link = "logit"), data = data)
+treat_model_1 =  glm(data = data, formula = qsmk ~ sex + race + age + I(age*age) + education + smokeintensity + I(smokeintensity*smokeintensity) + smokeyrs + I(smokeyrs*smokeyrs) + exercise + active + wt71 + I(wt71*wt71), family = binomial("logit"))
+
+data = data %>% 
+  mutate(
+    treat_model_r = predict(treat_model, type = "response"),
+    treat_model_1_r = predict(treat_model_1, type = "response"),
+    ipw = ifelse(qsmk==1, 1/treat_model_1_r, 1/(1- treat_model_1_r)),
+    sbipw = ifelse(qsmk==1,treat_model_r/ treat_model_1_r,(1-treat_model_r)/(1-treat_model_1_r ))
+  )
+```
+
+
+### Graph
+
+
+```{r}
+data %>% 
+  group_by(qsmk) %>% 
+  ggplot(aes(x = ipw, color = qsmk, fill = qsmk)) +
+  geom_histogram(bins = 50) +
+  theme_minimal() 
+
+
+```
+
+```{r}
+data %>% 
+  group_by(qsmk) %>% 
+  ggplot(aes(x = sbipw, color = qsmk, fill = qsmk)) +
+  geom_histogram(bins = 50) +
+  theme_minimal() 
+
+```
+
+
+
+### fit the outcome model for unstabilized method
+
+```{r}
+om = glm(wt82_71 ~  qsmk ,weights = ipw, data = data,family = gaussian())
+om %>% tidy()
+
+```
+
+### Fit the causal model for stabilized method
+
+```{r}
+om = glm(wt82_71 ~  qsmk ,weights = sbipw, data = data,family = gaussian())
+om %>% tidy()
+
+```
+
+
+### Bootstrappning
+
+```{r}
+
+library(tidymodels)
+set.seed(972188635)
+boots <- bootstraps(data, times = 1e3, apparent = FALSE)
+iptw_model_sw <- function(data) {
+  glm(formula = wt82_71 ~ qsmk, family = gaussian(), weight = sbipw, data = data)
+}
+boot_models <- boots %>% 
+  mutate(
+    model = map(.x = splits, ~iptw_model_sw(data = .x)),
+    coef_info = map(model, ~broom::tidy(.x)))
+int_pctl(boot_models, coef_info)
+```
+
+
+### Checking positivity
+
+* Structural violations
+  - Individuals with some levels of confounders cannot be treated (contraindcations for medications, etc.)
+  - Causal inferences are impossible for the entire population using IPW or standardization
+* Random violations
+  - Finite data sample
+  - Parametric modeling to smooth over random zeroes
+  
+  
+### Marginal structural models (MSMs)
+
+* Models for marginal potential outcomes
+* Marginal: marginal effect of exposure on the outcome
+* Structural: for PO
+
+```{r}
+data_smkint <- data %>% filter(smokeintensity < 26)
+data_smkint %>% head()
+```
+
+## Fitting IP weighting 
+
+* Here is for continuous treatment.
+
+```{r}
+pr_a <- lm(data = data_smkint, formula = smkintensity82_71~1)
+pr_a_l <- lm(data = data_smkint, formula = smkintensity82_71 ~ sex + race + age + I(age*age) + education + smokeintensity + I(smokeintensity*smokeintensity) + smokeyrs + I(smokeyrs*smokeyrs) + exercise + active + wt71 + I(wt71*wt71))
+sd_a <- summary(pr_a)$sigma
+sd_a_l <- summary(pr_a_l)$sigma
+data_smkint %<>% mutate(
+  p_a = predict(object = pr_a, type = "response"),
+  p_a_l = predict(object = pr_a_l, type = "response"),
+  ## continuous outcome 
+  density_num = dnorm(x = smkintensity82_71, mean = p_a, sd = sd_a),
+  density_denom = dnorm(x = smkintensity82_71, mean = p_a_l, sd = sd_a_l),
+  # for average treatment effect
+  sw_iptw = density_num/density_denom
+)
+summary(data_smkint$sw_iptw)
+```
+
+### Bootstrapping 
+
+```{r}
+set.seed(198877)
+boots <- bootstraps(data_smkint, times = 1e3, apparent = FALSE)
+iptw_model <- function(data) {
+  glm(formula = wt82_71 ~ smkintensity82_71 + I(smkintensity82_71*smkintensity82_71), family = gaussian(), weight = sw_iptw, data = data)
+}
+boot_models <- boots %>% 
+  mutate(
+    model = map(.x = splits, ~iptw_model(data = .x)),
+    coef_info = map(model, ~broom::tidy(.x)))
+int_pctl(.data = boot_models, statistics = coef_info)
+```
+
+
+### Now stratification based on sex 
+
+
+```{r}
+treat_model_s = glm(qsmk ~ sex, family = binomial(link = "logit"), data = data)
+treat_model_1_s =  glm(data = data, formula = qsmk ~ sex + race + age + I(age*age) + education + smokeintensity + I(smokeintensity*smokeintensity) + smokeyrs + I(smokeyrs*smokeyrs) + exercise + active + wt71 + I(wt71*wt71), family = binomial("logit"))
+
+data = data %>% 
+  mutate(
+    treat_model_r = predict(treat_model_s, type = "response"),
+    treat_model_1_r = predict(treat_model_1_s, type = "response"),
+    ipw = ifelse(qsmk==1, 1/treat_model_1_r, 1/(1- treat_model_1_r)),
+    sbipw = ifelse(qsmk==1,treat_model_r/ treat_model_1_r,(1-treat_model_r)/(1-treat_model_1_r ))
+  )
+```
+
+
+
+```{r}
+set.seed(972188635)
+boots <- bootstraps(data, times = 1e3, apparent = FALSE)
+iptw_model_sw <- function(data) {
+  glm(formula = wt82_71 ~ qsmk*sex, family = gaussian(), weight = sbipw, data = data)
+}
+boot_models <- boots %>% 
+  mutate(
+    model = map(.x = splits, ~iptw_model_sw(data = .x)),
+    coef_info = map(model, ~broom::tidy(.x)))
+int_pctl(boot_models, coef_info)
+
+```
+
+
+## Censoring and missing data
+
+```{r}
+data <- readr::read_csv(file = "https://cdn1.sph.harvard.edu/wp-content/uploads/sites/1268/1268/20/nhefs.csv") %>% 
+  mutate(
+    education = case_when(
+      education == 1  ~ "8th grade or less",
+      education == 2 ~ "HS dropout",
+      education == 3 ~ "HS",
+      education == 4 ~ "College dropout",
+      education == 5 ~ "College or more",
+      T ~ "missing"
+    ),
+    cens = case_when(
+      is.na(wt82) ~ 1, 
+      T ~ 0
+    )
+  ) %>% 
+  mutate(across(.cols = c(qsmk, sex, race, education, exercise, active, cens), .fns = forcats::as_factor))
+
+```
+
+### IP weigthing for normal cases
+
+```{r}
+pr_a <- glm(data = data, formula = qsmk~1, family = binomial("logit"))
+pr_a_l <- glm(data = data, formula = qsmk ~ sex + race + age + I(age*age) + education + smokeintensity + I(smokeintensity*smokeintensity) + smokeyrs + I(smokeyrs*smokeyrs) + exercise + active + wt71 + I(wt71*wt71), family = binomial("logit"))
+data %<>% mutate(
+  p_a = predict(object = pr_a, type = "response"),
+  p_a_l = predict(object = pr_a_l, type = "response"),
+  sw_iptw = if_else(qsmk == 1, p_a/p_a_l, (1-p_a)/(1-p_a_l)) # stabilized weights
+)
+```
+
+### Ip weighting for censoring
+
+```{r}
+pr_c <- glm(data = data, formula = cens~qsmk, family = binomial("logit"))
+pr_c_l <- glm(data = data, formula = cens ~ qsmk + sex + race + age + I(age*age) + education + smokeintensity + I(smokeintensity*smokeintensity) + smokeyrs + I(smokeyrs*smokeyrs) + exercise + active + wt71 + I(wt71*wt71), family = binomial("logit"))
+data %<>% mutate(
+  p_c = predict(object = pr_c, type = "response"),
+  p_c_l = predict(object = pr_c_l, type = "response"),
+  sw_ipcw = if_else(cens == 0, (1-p_c)/(1-p_c_l), 1),
+  w = sw_iptw * sw_ipcw
+)
+
+```
+
+### Causal effect for censoring 
+
+```{r}
+set.seed(9721835)
+boots <- bootstraps(data, times = 1e3, apparent = FALSE)
+w_model <- function(data) {
+  glm(formula = wt82_71 ~ qsmk, family = gaussian(), weight = w, data = data)
+}
+boot_models <- boots %>% 
+  mutate(
+    model = map(.x = splits, ~w_model(data = .x)),
+    coef_info = map(model, ~broom::tidy(.x)))
+int_pctl(boot_models, coef_info)
+
+```
+
+
+
+# Chapter 2 Standardization 
+
+
